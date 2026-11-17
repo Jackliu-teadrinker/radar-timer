@@ -11,6 +11,11 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      rounds:
+        description: '循环拍数（默认 16 拍 × 20min ≈ 5.3h；<4 为测试，不接力）'
+        required: false
+        default: '16'
 
 permissions:
   contents: write
@@ -27,8 +32,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Watch freshness in a loop (16 rounds x 20min)
+        id: loop
         env:
           RADAR_PAT: ${{ secrets.RADAR_PAT }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
         run: |
           python3 - <<'PY'
           import json, os, sys, time, urllib.request, urllib.error
@@ -39,7 +46,7 @@ jobs:
           WF = "update-news.yml"
           STALE_MIN = 22            # 数据超过这个年龄就补一刀（目标节奏 ~25-30min）
           RECENT_WINDOW_SEC = 1500  # 25min 内有 run 就不再派（防级联，也避开自己的上一轮）
-          ROUNDS = 16               # 16 x 20min ≈ 5.3h，留在 350min job 上限内
+          ROUNDS = int(os.environ.get("ROUNDS_IN") or 16)  # 16 x 20min ≈ 5.3h，留在 350min 上限内
           SLEEP_SEC = 1200
 
           if not TOKEN:
@@ -133,6 +140,24 @@ jobs:
                   time.sleep(SLEEP_SEC)
           print("[done] loop finished")
           PY
+
+      - name: Chain next run (self-sustaining, schedule-independent)
+        # GitHub 对本账号的 schedule 限流极重（fork 1/24 命中；非 fork 新仓 85min 0 命中），
+        # 所以不靠 schedule：一轮 5.3h 结束后用 PAT 派自己一次，形成永续接力。
+        # 只在前一轮真正跑完（success）时接力，避免启动即崩导致死循环。
+        if: always() && steps.loop.outcome == 'success'
+        env:
+          RADAR_PAT: ${{ secrets.RADAR_PAT }}
+          ROUNDS_IN: ${{ github.event.inputs.rounds || '16' }}
+        run: |
+          if [ "${ROUNDS_IN:-16}" -lt 4 ]; then
+            echo "short test run (rounds=$ROUNDS_IN) -> skip chaining"
+            exit 0
+          fi
+          code=$(curl -sS -o /tmp/chain.out -w "%{http_code}" -X POST             -H "Authorization: token $RADAR_PAT"             -H "Accept: application/vnd.github+json"             https://api.github.com/repos/Jackliu-teadrinker/radar-timer/actions/workflows/timer.yml/dispatches             -d '{"ref":"main"}')
+          echo "chain dispatch: HTTP $code"
+          cat /tmp/chain.out || true
+          [ "$code" = "204" ] || exit 1
 
       - name: Keepalive (avoid 60-day inactivity disable)
         if: always()

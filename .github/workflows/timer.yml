@@ -1,10 +1,11 @@
 name: Radar external timer
 
-# 为什么存在这个仓库：
-#   ai-news-radar 是 fork（parent: LearnPrompt/ai-news-radar），GitHub 对 fork 仓库的
-#   schedule 触发做了限流——2026-11-17 实测 24 个整点机会只命中 1 个（03 点）。
-#   本仓库是独立非 fork 公开仓库，schedule 正常触发；每 20 分钟检查雷达数据新鲜度，
-#   stale 且无在途 run 时用 PAT 调 workflow_dispatch 让云端采集腿干活。
+# 存在的理由：
+#   ai-news-radar 是 fork（parent: LearnPrompt/ai-news-radar），GitHub 对 fork 的 schedule
+#   触发做限流——2026-11-17 实测 24 个整点机会只命中 1 个（03 点）。
+#   GitHub 的 schedule 全局都是 best-effort，即使非 fork 也会延迟/丢弃。
+#   所以这里不指望"每次都被调度"：一次触发就在 job 内自我循环 ~5.3 小时，
+#   把可靠性要求从"每天 96 次命中"降到"每 5 小时 1 次命中"。
 
 on:
   schedule:
@@ -15,17 +16,17 @@ permissions:
   contents: write
 
 concurrency:
-  group: radar-timer
+  group: radar-timer-loop
   cancel-in-progress: false
 
 jobs:
-  tick:
+  loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check radar freshness and dispatch if stale
+      - name: Watch freshness in a loop (16 rounds x 20min)
         env:
           RADAR_PAT: ${{ secrets.RADAR_PAT }}
         run: |
@@ -36,12 +37,17 @@ jobs:
           TOKEN = os.environ.get("RADAR_PAT", "")
           REPO = "Jackliu-teadrinker/ai-news-radar"
           WF = "update-news.yml"
-          STALE_MIN = 22          # 超过这个年龄就补一刀（目标节奏 ~25-30min 一轮）
-          RECENT_WINDOW_SEC = 1500  # 20min 内已有 run 就不再派（防级联）
+          STALE_MIN = 22            # 数据超过这个年龄就补一刀（目标节奏 ~25-30min）
+          RECENT_WINDOW_SEC = 1500  # 25min 内有 run 就不再派（防级联，也避开自己的上一轮）
+          ROUNDS = 16               # 16 x 20min ≈ 5.3h，留在 350min job 上限内
+          SLEEP_SEC = 1200
 
           if not TOKEN:
               print("[FATAL] RADAR_PAT 未配置")
               sys.exit(1)
+
+          AUTH = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json",
+                  "User-Agent": "radar-timer/1.0"}
 
           def get(url, timeout=25, retries=3):
               last = None
@@ -56,67 +62,76 @@ jobs:
                           time.sleep(2 * (i + 1))
               raise last
 
-          # 1. freshness：分片索引优先（真实更新时间），24h 快照兜底
-          age, gen = 9999.0, None
-          for url, label in ((
-              "https://jackliu-teadrinker.github.io/ai-news-radar/data/days/index.json", "days-index"), (
-              "https://jackliu-teadrinker.github.io/ai-news-radar/data/latest-24h-min.json", "24h-min")):
+          def freshness():
+              age, gen = 9999.0, None
+              for url, label in ((
+                  "https://jackliu-teadrinker.github.io/ai-news-radar/data/days/index.json", "days-index"), (
+                  "https://jackliu-teadrinker.github.io/ai-news-radar/data/latest-24h-min.json", "24h-min")):
+                  try:
+                      d = json.loads(get(url + f"?cb={int(time.time())}"))
+                      g_at = d.get("generated_at")
+                      if not g_at:
+                          continue
+                      g = datetime.fromisoformat(g_at.replace("Z", "+00:00"))
+                      a = (datetime.now(timezone.utc) - g).total_seconds() / 60
+                      print(f"[freshness] {label}: generated_at={g_at} age={a:.0f}min")
+                      if a < age:
+                          age, gen = a, g_at
+                  except Exception as e:
+                      print(f"[freshness] {label} failed: {e}")
+              return age, gen
+
+          def busy_runs():
               try:
-                  d = json.loads(get(url + f"?cb={int(time.time())}"))
-                  g_at = d.get("generated_at")
-                  if not g_at:
-                      continue
-                  g = datetime.fromisoformat(g_at.replace("Z", "+00:00"))
-                  a = (datetime.now(timezone.utc) - g).total_seconds() / 60
-                  print(f"[freshness] {label}: generated_at={g_at} age={a:.0f}min")
-                  if a < age:
-                      age, gen = a, g_at
+                  req = urllib.request.Request(
+                      f"https://api.github.com/repos/{REPO}/actions/workflows/{WF}/runs?per_page=15",
+                      headers=AUTH)
+                  runs = json.loads(urllib.request.urlopen(req, timeout=25).read())["workflow_runs"]
+                  cutoff = datetime.now(timezone.utc).timestamp() - RECENT_WINDOW_SEC
+                  return sum(1 for r in runs
+                             if r["status"] in ("queued", "in_progress", "waiting")
+                             or datetime.fromisoformat(
+                                 r["created_at"].replace("Z", "+00:00")).timestamp() > cutoff)
               except Exception as e:
-                  print(f"[freshness] {label} failed: {e}")
+                  print(f"[busy-check] failed (放行): {e}")
+                  return 0
 
-          stale = age > STALE_MIN
-          print(f"[freshness] youngest age={age:.0f}min stale={stale} (threshold {STALE_MIN}min)")
-
-          # 2. busy-check：update-news 是否在途 / 刚跑过
-          auth = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json",
-                  "User-Agent": "radar-timer/1.0"}
-          busy = 0
-          try:
-              req = urllib.request.Request(
-                  f"https://api.github.com/repos/{REPO}/actions/workflows/{WF}/runs?per_page=15",
-                  headers=auth)
-              runs = json.loads(urllib.request.urlopen(req, timeout=25).read())["workflow_runs"]
-              cutoff = datetime.now(timezone.utc).timestamp() - RECENT_WINDOW_SEC
-              busy = sum(1 for r in runs
-                         if r["status"] in ("queued", "in_progress", "waiting")
-                         or datetime.fromisoformat(
-                             r["created_at"].replace("Z", "+00:00")).timestamp() > cutoff)
-          except Exception as e:
-              print(f"[busy-check] failed (放行): {e}")
-
-          print(f"[busy-check] active/recent runs: {busy}")
-
-          # 3. 补刀
-          if stale and busy == 0:
-              print(f"[rescue] stale {age:.0f}min > {STALE_MIN}min and idle -> dispatch {WF}")
+          def dispatch():
               body = json.dumps({"ref": "master"}).encode()
               req = urllib.request.Request(
                   f"https://api.github.com/repos/{REPO}/actions/workflows/{WF}/dispatches",
                   data=body, method="POST",
-                  headers={**auth, "Content-Type": "application/json"})
-              try:
-                  urllib.request.urlopen(req, timeout=25)
-                  print("[rescue] dispatched OK")
-              except urllib.error.HTTPError as e:
-                  print(f"[rescue] dispatch FAILED: {e.code} {e.read()[:200]}")
-                  sys.exit(1)
-          elif stale:
-              print(f"[rescue] stale but {busy} run(s) active/recent -> skip")
-          else:
-              print("[rescue] data fresh, nothing to do")
+                  headers={**AUTH, "Content-Type": "application/json"})
+              urllib.request.urlopen(req, timeout=25)
 
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-              f.write(f"**age**: {age:.0f} min | **stale**: {stale} | **busy**: {busy}\n")
+          for rnd in range(1, ROUNDS + 1):
+              print(f"=== round {rnd}/{ROUNDS} {datetime.now(timezone.utc).strftime('%H:%M:%S')}Z")
+              age, gen = freshness()
+              stale = age > STALE_MIN
+              print(f"[freshness] youngest age={age:.0f}min stale={stale} (threshold {STALE_MIN}min)")
+              busy = busy_runs()
+              print(f"[busy-check] active/recent runs: {busy}")
+
+              if stale and busy == 0:
+                  print(f"[rescue] stale {age:.0f}min and idle -> dispatch {WF}")
+                  try:
+                      dispatch()
+                      print("[rescue] dispatched OK")
+                  except urllib.error.HTTPError as e:
+                      print(f"[rescue] dispatch FAILED: {e.code} {e.read()[:200]}")
+                  except Exception as e:
+                      print(f"[rescue] dispatch FAILED: {e}")
+              elif stale:
+                  print(f"[rescue] stale but {busy} run(s) active/recent -> skip")
+              else:
+                  print("[rescue] data fresh, nothing to do")
+
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"- round {rnd}: age={age:.0f}min stale={stale} busy={busy}\n")
+
+              if rnd < ROUNDS:
+                  time.sleep(SLEEP_SEC)
+          print("[done] loop finished")
           PY
 
       - name: Keepalive (avoid 60-day inactivity disable)

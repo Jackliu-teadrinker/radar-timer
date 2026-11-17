@@ -1,0 +1,137 @@
+name: Radar external timer
+
+# 为什么存在这个仓库：
+#   ai-news-radar 是 fork（parent: LearnPrompt/ai-news-radar），GitHub 对 fork 仓库的
+#   schedule 触发做了限流——2026-11-17 实测 24 个整点机会只命中 1 个（03 点）。
+#   本仓库是独立非 fork 公开仓库，schedule 正常触发；每 20 分钟检查雷达数据新鲜度，
+#   stale 且无在途 run 时用 PAT 调 workflow_dispatch 让云端采集腿干活。
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: radar-timer
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check radar freshness and dispatch if stale
+        env:
+          RADAR_PAT: ${{ secrets.RADAR_PAT }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.request, urllib.error
+          from datetime import datetime, timezone
+
+          TOKEN = os.environ.get("RADAR_PAT", "")
+          REPO = "Jackliu-teadrinker/ai-news-radar"
+          WF = "update-news.yml"
+          STALE_MIN = 22          # 超过这个年龄就补一刀（目标节奏 ~25-30min 一轮）
+          RECENT_WINDOW_SEC = 1500  # 20min 内已有 run 就不再派（防级联）
+
+          if not TOKEN:
+              print("[FATAL] RADAR_PAT 未配置")
+              sys.exit(1)
+
+          def get(url, timeout=25, retries=3):
+              last = None
+              for i in range(retries):
+                  try:
+                      req = urllib.request.Request(url, headers={
+                          "User-Agent": "radar-timer/1.0", "Cache-Control": "no-cache"})
+                      return urllib.request.urlopen(req, timeout=timeout).read()
+                  except Exception as e:
+                      last = e
+                      if i < retries - 1:
+                          time.sleep(2 * (i + 1))
+              raise last
+
+          # 1. freshness：分片索引优先（真实更新时间），24h 快照兜底
+          age, gen = 9999.0, None
+          for url, label in ((
+              "https://jackliu-teadrinker.github.io/ai-news-radar/data/days/index.json", "days-index"), (
+              "https://jackliu-teadrinker.github.io/ai-news-radar/data/latest-24h-min.json", "24h-min")):
+              try:
+                  d = json.loads(get(url + f"?cb={int(time.time())}"))
+                  g_at = d.get("generated_at")
+                  if not g_at:
+                      continue
+                  g = datetime.fromisoformat(g_at.replace("Z", "+00:00"))
+                  a = (datetime.now(timezone.utc) - g).total_seconds() / 60
+                  print(f"[freshness] {label}: generated_at={g_at} age={a:.0f}min")
+                  if a < age:
+                      age, gen = a, g_at
+              except Exception as e:
+                  print(f"[freshness] {label} failed: {e}")
+
+          stale = age > STALE_MIN
+          print(f"[freshness] youngest age={age:.0f}min stale={stale} (threshold {STALE_MIN}min)")
+
+          # 2. busy-check：update-news 是否在途 / 刚跑过
+          auth = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json",
+                  "User-Agent": "radar-timer/1.0"}
+          busy = 0
+          try:
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/actions/workflows/{WF}/runs?per_page=15",
+                  headers=auth)
+              runs = json.loads(urllib.request.urlopen(req, timeout=25).read())["workflow_runs"]
+              cutoff = datetime.now(timezone.utc).timestamp() - RECENT_WINDOW_SEC
+              busy = sum(1 for r in runs
+                         if r["status"] in ("queued", "in_progress", "waiting")
+                         or datetime.fromisoformat(
+                             r["created_at"].replace("Z", "+00:00")).timestamp() > cutoff)
+          except Exception as e:
+              print(f"[busy-check] failed (放行): {e}")
+
+          print(f"[busy-check] active/recent runs: {busy}")
+
+          # 3. 补刀
+          if stale and busy == 0:
+              print(f"[rescue] stale {age:.0f}min > {STALE_MIN}min and idle -> dispatch {WF}")
+              body = json.dumps({"ref": "master"}).encode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{REPO}/actions/workflows/{WF}/dispatches",
+                  data=body, method="POST",
+                  headers={**auth, "Content-Type": "application/json"})
+              try:
+                  urllib.request.urlopen(req, timeout=25)
+                  print("[rescue] dispatched OK")
+              except urllib.error.HTTPError as e:
+                  print(f"[rescue] dispatch FAILED: {e.code} {e.read()[:200]}")
+                  sys.exit(1)
+          elif stale:
+              print(f"[rescue] stale but {busy} run(s) active/recent -> skip")
+          else:
+              print("[rescue] data fresh, nothing to do")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"**age**: {age:.0f} min | **stale**: {stale} | **busy**: {busy}\n")
+          PY
+
+      - name: Keepalive (avoid 60-day inactivity disable)
+        if: always()
+        run: |
+          # GitHub 会停用 60 天无推送仓库的 schedule；每 7 天写一次心跳文件
+          last=$(git log -1 --format=%ct -- heartbeat.txt 2>/dev/null || echo 0)
+          now=$(date +%s)
+          if [ $(( now - last )) -gt 604800 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+            git config user.name "radar-timer"
+            git config user.email "radar-timer@users.noreply.github.com"
+            git add heartbeat.txt
+            git commit -m "[timer] heartbeat $(date -u +%F)"
+            git push
+          else
+            echo "heartbeat fresh, skip"
+          fi
